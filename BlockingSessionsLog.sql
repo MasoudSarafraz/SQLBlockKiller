@@ -1,4 +1,3 @@
--- ????? ???? ??? ??????? (??? ???? ?????)
 IF NOT EXISTS (
                   SELECT
                       *
@@ -27,7 +26,6 @@ IF NOT EXISTS (
             ,ErrorMessage              NVARCHAR (MAX)
         );
 
--- ??????? ??????? Blocking ? ????? ?? ???? ????
 DECLARE @BlockingSessions TABLE
     (
         RowID                      INT IDENTITY (1, 1) PRIMARY KEY
@@ -44,7 +42,6 @@ DECLARE @BlockingSessions TABLE
         ,IsCriticalSession         BIT
     );
 
--- ???????? ???????? ??????? Blocking
 INSERT INTO @BlockingSessions
 (
     BlockingSessionID
@@ -90,7 +87,7 @@ INSERT INTO @BlockingSessions
                  END
             FROM sys.dm_exec_sessions                                 AS blocking
                 INNER JOIN sys.dm_exec_requests                       AS blocked ON blocking.session_id = blocked.blocking_session_id
-                CROSS APPLY sys.dm_exec_sql_text (blocked.sql_handle) AS sql_text -- ????? ?? blocked.sql_handle
+                CROSS APPLY sys.dm_exec_sql_text (blocked.sql_handle) AS sql_text 
             WHERE
                 blocked.blocking_session_id IS NOT NULL
                 AND blocked.session_id <> blocked.blocking_session_id
@@ -103,7 +100,7 @@ INSERT INTO @BlockingSessions
                 ,blocking.transaction_isolation_level
                 ,sql_text.text
             HAVING
-                DATEDIFF (SECOND, MIN (blocked.start_time), GETDATE ()) > 120 -- ??? ?? ? ?????
+                DATEDIFF (SECOND, MIN (blocked.start_time), GETDATE ()) > 120 -- Time
                 AND CASE WHEN blocking.program_name LIKE '%SQLAgent%' THEN 1
                         WHEN blocking.login_name = 'sa' THEN 1
                         WHEN sql_text.text LIKE '%BACKUP%DATABASE%' THEN 1
@@ -116,7 +113,6 @@ INSERT INTO @BlockingSessions
                     ELSE 0
                     END                                                 = 0;
 
--- ?????? ?????? ?? ???? WHILE
 DECLARE
     @RowID                      INT
     ,@BlockingSessionID         INT
@@ -166,7 +162,7 @@ WHILE EXISTS (
                               AND login_name   = @BlockingLoginName
                       )
                 BEGIN
-                    SET @KillReason = N'Blocking ??? ?? ? ????? ?? ??????? ' + @BlockingDatabaseName;
+                    SET @KillReason = N'Blocking ةOther Session ' + @BlockingDatabaseName;
                     SET @KillCommand = N'KILL ' + CAST (@BlockingSessionID AS NVARCHAR (10));
                     EXEC sp_executesql @KillCommand;
 
@@ -200,8 +196,6 @@ WHILE EXISTS (
                         ,@KillReason
                         ,1
                     );
-
-                --PRINT '??? ' + CAST(@BlockingSessionID AS NVARCHAR(10)) + ' Kill ??.';
                 END
         END TRY
         BEGIN CATCH
@@ -244,6 +238,3 @@ WHILE EXISTS (
         WHERE
             RowID = @RowID;
     END
-
-
-SELECT * FROM master.dbo.BlockingSessionsLog WHERE LogTime >= DATEADD(MINUTE, -5, GETDATE());
