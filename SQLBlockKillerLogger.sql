@@ -162,7 +162,7 @@ WHILE EXISTS (
                               AND login_name   = @BlockingLoginName
                       )
                 BEGIN
-                    SET @KillReason = N'Blocking ةOther Session ' + @BlockingDatabaseName;
+                    SET @KillReason = N'Blocking Other Session ' + @BlockingDatabaseName;
                     SET @KillCommand = N'KILL ' + CAST (@BlockingSessionID AS NVARCHAR (10));
                     EXEC sp_executesql @KillCommand;
 
