@@ -97,7 +97,7 @@ AS (
 		,blocking.database_id
 		,blocking.transaction_isolation_level
 		,blocking_text.TEXT
-	HAVING DATEDIFF(SECOND, MIN(blocked.start_time), GETDATE()) > 1
+	HAVING DATEDIFF(SECOND, MIN(blocked.start_time), GETDATE()) > 120
 	)
 SELECT BlockingSessionID = session_id
 	,BlockedCount
