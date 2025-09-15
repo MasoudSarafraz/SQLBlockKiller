@@ -5,4 +5,3 @@
 
 # Warning
 *this query not killing Importan session. for example Query Running by sa or Running by SQLAGENT. you can change the filters*
-*this query will kill session only have more than 2 minute running*
