@@ -32,23 +32,124 @@ DECLARE @MinDuration INT = 30; -- حداقل زمان مسدودسازی برا�
 DECLARE @MaxDuration INT = 300; -- حداکثر زمان مجاز (ثانیه)
 DECLARE @MaxKillCount INT = 10; -- حداکثر تعداد kill در هر اجرا
 
--- محاسبه بار فعلی سیستم برای تنظیم آستانه
+-- محاسبه بار سیستم با رویکرد ترکیبی بهینه
 DECLARE @CurrentLoad INT;
-SELECT @CurrentLoad = COUNT(*)
-FROM sys.dm_exec_sessions
+DECLARE @CPU_Usage INT;
+DECLARE @Active_Requests INT;
+DECLARE @Blocked_Sessions INT;
+DECLARE @Pending_IO INT;
+DECLARE @Total_Waits BIGINT;
+DECLARE @Resource_Waits BIGINT;
+
+-- 1. دریافت استفاده از CPU (درصد) - روش اصلاح شده
+SELECT @CPU_Usage = cntr_value
+FROM sys.dm_os_performance_counters
+WHERE counter_name = '% Processor Time'
+      AND object_name LIKE '%Processor%'
+      AND instance_name = '_Total';
+
+-- 2. دریافت تعداد درخواست‌های فعال
+SELECT @Active_Requests = COUNT(*)
+FROM sys.dm_exec_requests
 WHERE status = 'running';
 
+-- 3. دریافت تعداد جلسات مسدود شده
+SELECT @Blocked_Sessions = COUNT(*)
+FROM sys.dm_exec_requests
+WHERE blocking_session_id <> 0;
+
+-- 4. دریافت تعداد درخواست‌های I/O در انتظار
+SELECT @Pending_IO = COUNT(*)
+FROM sys.dm_io_pending_io_requests;
+
+-- 5. دریافت آمار wait stats (فقط برای بررسی شدت)
+SELECT @Total_Waits = SUM(wait_time_ms),
+       @Resource_Waits = SUM(wait_time_ms) - SUM(signal_wait_time_ms)
+FROM sys.dm_os_wait_stats;
+
+-- محاسبه بار ترکیبی با وزن‌های بهینه
+SET @CurrentLoad =
+-- وزن 40% برای CPU
+CASE
+    WHEN @CPU_Usage > 90 THEN
+        40
+    WHEN @CPU_Usage > 70 THEN
+        30
+    WHEN @CPU_Usage > 50 THEN
+        20
+    WHEN @CPU_Usage > 30 THEN
+        10
+    ELSE
+        0
+END +
+-- وزن 25% برای درخواست‌های فعال
+CASE
+    WHEN @Active_Requests > 100 THEN
+        25
+    WHEN @Active_Requests > 50 THEN
+        15
+    WHEN @Active_Requests > 20 THEN
+        10
+    WHEN @Active_Requests > 10 THEN
+        5
+    ELSE
+        0
+END +
+-- وزن 20% برای جلسات مسدود شده
+CASE
+    WHEN @Blocked_Sessions > 20 THEN
+        20
+    WHEN @Blocked_Sessions > 10 THEN
+        15
+    WHEN @Blocked_Sessions > 5 THEN
+        10
+    WHEN @Blocked_Sessions > 2 THEN
+        5
+    ELSE
+        0
+END +
+-- وزن 15% برای I/O در انتظار
+CASE
+    WHEN @Pending_IO > 50 THEN
+        15
+    WHEN @Pending_IO > 20 THEN
+        10
+    WHEN @Pending_IO > 10 THEN
+        5
+    ELSE
+        0
+END;
+
+-- تنظیم نهایی بار سیستم با در نظر گرفتن wait stats
+-- اگر wait stats بسیار بالا باشد، بار را افزایش می‌دهیم
+IF @Resource_Waits > 1000000 -- >1000 ثانیه
+    SET @CurrentLoad = @CurrentLoad + 20;
+ELSE IF @Resource_Waits > 500000 -- >500 ثانیه
+    SET @CurrentLoad = @CurrentLoad + 10;
+ELSE IF @Resource_Waits > 100000 -- >100 ثانیه
+    SET @CurrentLoad = @CurrentLoad + 5;
+
+-- محدود کردن مقدار بین 0 تا 100
+IF @CurrentLoad > 100
+    SET @CurrentLoad = 100;
+IF @CurrentLoad < 0
+    SET @CurrentLoad = 0;
+
+-- تنظیم آستانه پویا بر اساس بار سیستم
 DECLARE @DynamicThreshold INT;
 SET @DynamicThreshold = CASE
-                            WHEN @CurrentLoad > 100 THEN
-                                60  -- بار بالا: آستانه کمتر
-                            WHEN @CurrentLoad > 50 THEN
-                                90  -- بار متوسط
+                            WHEN @CurrentLoad > 80 THEN
+                                45  -- بار بسیار بالا: آستانه بسیار کم
+                            WHEN @CurrentLoad > 60 THEN
+                                60  -- بار بالا: آستانه کم
+                            WHEN @CurrentLoad > 40 THEN
+                                90  -- بار متوسط: آستانه متوسط
+                            WHEN @CurrentLoad > 20 THEN
+                                120 -- بار کم: آستانه بالا
                             ELSE
-                                120 -- بار کم: آستانه بیشتر
+                                150 -- بار بسیار کم: آستانه بسیار بالا
                         END;
 
--- استفاده از جدول موقت برای ذخیره نتایج CTE
 IF OBJECT_ID('tempdb..#BlockingSessions') IS NOT NULL
     DROP TABLE #BlockingSessions;
 
@@ -69,7 +170,7 @@ CREATE TABLE #BlockingSessions
     IsCriticalSession INT
 );
 
--- پر کردن جدول موقت با نتایج CTE
+-- پر کردن جدول موقت با نتایج
 INSERT INTO #BlockingSessions
 SELECT blocking.session_id,
        COUNT(blocked.session_id) AS BlockedCount,
@@ -94,7 +195,7 @@ SELECT blocking.session_id,
            WHEN 5 THEN
                N'Snapshot'
        END AS IsolationLevel,
-       -- محاسبه امتیاز مسدودسازی
+       -- محاسبه امتیاز مسدودسازی (تعداد جلسات * زمان)
        COUNT(blocked.session_id) * DATEDIFF(SECOND, MIN(blocked.start_time), GETDATE()) AS BlockingScore,
        -- تعیین سطح اقدام
        CASE
@@ -191,7 +292,7 @@ FROM #BlockingSessions
 WHERE IsCriticalSession = 0
       AND ActionLevel > 0;
 
--- لاگ کردن تمام جلسات مسدودکننده (حتی اگر kill نشوند)
+-- لاگ کردن تمام جلسات مسدودکننده
 INSERT INTO master.dbo.BlockingSessionsLog
 (
     BlockingSessionID,
@@ -330,8 +431,6 @@ BEGIN
     SELECT @KillCount = COUNT(*)
     FROM #SessionsToKill;
 END;
-
--- پاک‌سازی جداول موقت
 DROP TABLE #SessionsToKill;
 DROP TABLE #NonCriticalSessions;
 DROP TABLE #BlockingSessions;
