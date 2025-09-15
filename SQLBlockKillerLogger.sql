@@ -1,3 +1,4 @@
+-- بهبود یافته برای SQL Server 2008 R2 با پشتیبانی از جلسات sleeping با تراکنش باز
 IF NOT EXISTS
 (
     SELECT 1
@@ -41,7 +42,7 @@ DECLARE @Pending_IO INT;
 DECLARE @Total_Waits BIGINT;
 DECLARE @Resource_Waits BIGINT;
 
--- 1. دریافت استفاده از CPU (درصد) - روش اصلاح شده
+-- 1. دریافت استفاده از CPU (درصد)
 SELECT @CPU_Usage = cntr_value
 FROM sys.dm_os_performance_counters
 WHERE counter_name = '% Processor Time'
@@ -150,6 +151,7 @@ SET @DynamicThreshold = CASE
                                 150 -- بار بسیار کم: آستانه بسیار بالا
                         END;
 
+-- استفاده از جدول موقت برای ذخیره نتایج
 IF OBJECT_ID('tempdb..#BlockingSessions') IS NOT NULL
     DROP TABLE #BlockingSessions;
 
@@ -167,20 +169,26 @@ CREATE TABLE #BlockingSessions
     IsolationLevel NVARCHAR(50),
     BlockingScore INT,
     ActionLevel INT,
-    IsCriticalSession INT
+    IsCriticalSession INT,
+    SessionStatus NVARCHAR(30) -- اضافه کردن وضعیت جلسه برای دیباگ
 );
 
--- پر کردن جدول موقت با نتایج
+-- پر کردن جدول موقت با نتایج - اصلاح شده برای پشتیبانی از جلسات sleeping
 INSERT INTO #BlockingSessions
 SELECT blocking.session_id,
-       COUNT(blocked.session_id) AS BlockedCount,
-       blocking_text.text AS BlockingText,
+       COUNT(DISTINCT blocked.session_id) AS BlockedCount,
+       CASE
+           WHEN blocking.status = 'sleeping' THEN
+               'SLEEPING WITH OPEN TRANSACTION'
+           ELSE
+               COALESCE(blocking_text.text, 'UNKNOWN QUERY')
+       END AS BlockingText,
        blocking.login_name,
        blocking.host_name,
        blocking.program_name,
        DB_NAME(blocking.database_id) AS DatabaseName,
-       MIN(blocked.start_time) AS StartTime,
-       DATEDIFF(SECOND, MIN(blocked.start_time), GETDATE()) AS DurationSeconds,
+       MIN(COALESCE(blocked.start_time, blocking.last_request_start_time)) AS StartTime,
+       DATEDIFF(SECOND, MIN(COALESCE(blocked.start_time, blocking.last_request_start_time)), GETDATE()) AS DurationSeconds,
        CASE blocking.transaction_isolation_level
            WHEN 0 THEN
                N'Unspecified'
@@ -194,19 +202,22 @@ SELECT blocking.session_id,
                N'Serializable'
            WHEN 5 THEN
                N'Snapshot'
+           ELSE
+               'Unknown'
        END AS IsolationLevel,
        -- محاسبه امتیاز مسدودسازی (تعداد جلسات * زمان)
-       COUNT(blocked.session_id) * DATEDIFF(SECOND, MIN(blocked.start_time), GETDATE()) AS BlockingScore,
+       COUNT(DISTINCT blocked.session_id)
+       * DATEDIFF(SECOND, MIN(COALESCE(blocked.start_time, blocking.last_request_start_time)), GETDATE()) AS BlockingScore,
        -- تعیین سطح اقدام
        CASE
-           WHEN DATEDIFF(SECOND, MIN(blocked.start_time), GETDATE()) > @MaxDuration THEN
+           WHEN DATEDIFF(SECOND, MIN(COALESCE(blocked.start_time, blocking.last_request_start_time)), GETDATE()) > @MaxDuration THEN
                3 -- حتماً kill
-           WHEN COUNT(blocked.session_id) > @MinBlockedCount * 2 THEN
+           WHEN COUNT(DISTINCT blocked.session_id) > @MinBlockedCount * 2 THEN
                2 -- kill با اولویت بالا
            WHEN
            (
-               DATEDIFF(SECOND, MIN(blocked.start_time), GETDATE()) > @DynamicThreshold
-               AND COUNT(blocked.session_id) > @MinBlockedCount
+               DATEDIFF(SECOND, MIN(COALESCE(blocked.start_time, blocking.last_request_start_time)), GETDATE()) > @DynamicThreshold
+               AND COUNT(DISTINCT blocked.session_id) > @MinBlockedCount
            ) THEN
                1 -- kill با اولویت پایین
            ELSE
@@ -235,24 +246,48 @@ SELECT blocking.session_id,
                1
            ELSE
                0
-       END AS IsCriticalSession
+       END AS IsCriticalSession,
+       -- وضعیت جلسه برای دیباگ
+       blocking.status AS SessionStatus
 FROM sys.dm_exec_sessions AS blocking
-    INNER JOIN sys.dm_exec_requests AS blocked
+    -- پیوستن به sys.dm_exec_requests برای شناسایی جلسات مسدود شده
+    LEFT JOIN sys.dm_exec_requests AS blocked
         ON blocking.session_id = blocked.blocking_session_id
+    -- پیوستن به sys.dm_exec_connections برای گرفتن متن کوئری
     LEFT JOIN sys.dm_exec_connections c
         ON blocking.session_id = c.session_id
-    CROSS APPLY sys.dm_exec_sql_text(c.most_recent_sql_handle) AS blocking_text
-WHERE blocked.blocking_session_id IS NOT NULL
-      AND blocked.session_id <> blocked.blocking_session_id
-      AND blocking.is_user_process = 1
+    -- استفاده از OUTER APPLY برای گرفتن متن کوئری
+    OUTER APPLY sys.dm_exec_sql_text(c.most_recent_sql_handle) AS blocking_text
+WHERE blocking.is_user_process = 1
+      -- جلسه مسدودکننده باید یا در حال اجرا باشد یا تراکنش باز داشته باشد
+      AND
+      (
+          blocking.status = 'running'
+          OR EXISTS
+(
+    SELECT 1
+    FROM sys.dm_tran_session_transactions tst
+    WHERE tst.session_id = blocking.session_id
+          AND tst.is_user_transaction = 1
+)
+      )
+      -- و باید حداقل یک جلسه مسدود شده توسط آن جلسه وجود داشته باشد
+      AND EXISTS
+(
+    SELECT 1
+    FROM sys.dm_exec_requests b
+    WHERE b.blocking_session_id = blocking.session_id
+)
 GROUP BY blocking.session_id,
          blocking.login_name,
          blocking.host_name,
          blocking.program_name,
          blocking.database_id,
          blocking.transaction_isolation_level,
-         blocking_text.text
-HAVING DATEDIFF(SECOND, MIN(blocked.start_time), GETDATE()) > 10; -- حداقل زمان برای لاگ کردن
+         blocking_text.text,
+         blocking.status,
+         blocking.last_request_start_time
+HAVING DATEDIFF(SECOND, MIN(COALESCE(blocked.start_time, blocking.last_request_start_time)), GETDATE()) > 10; -- حداقل زمان برای لاگ کردن
 
 -- ایجاد جدول موقت برای جلسات غیرحیاتی
 IF OBJECT_ID('tempdb..#NonCriticalSessions') IS NOT NULL
@@ -271,7 +306,8 @@ CREATE TABLE #NonCriticalSessions
     BlockingDurationSeconds INT,
     TransactionIsolationLevel NVARCHAR(50),
     ActionLevel INT,
-    BlockingScore INT
+    BlockingScore INT,
+    SessionStatus NVARCHAR(30) -- اضافه کردن وضعیت جلسه برای دیباگ
 );
 
 -- پر کردن جدول جلسات غیرحیاتی
@@ -287,7 +323,8 @@ SELECT session_id AS BlockingSessionID,
        DurationSeconds AS BlockingDurationSeconds,
        IsolationLevel AS TransactionIsolationLevel,
        ActionLevel,
-       BlockingScore
+       BlockingScore,
+       SessionStatus
 FROM #BlockingSessions
 WHERE IsCriticalSession = 0
       AND ActionLevel > 0;
@@ -348,7 +385,8 @@ CREATE TABLE #SessionsToKill
     BlockingDurationSeconds INT,
     TransactionIsolationLevel NVARCHAR(50),
     ActionLevel INT,
-    BlockingScore INT
+    BlockingScore INT,
+    SessionStatus NVARCHAR(30) -- اضافه کردن وضعیت جلسه برای دیباگ
 );
 
 INSERT INTO #SessionsToKill
@@ -361,35 +399,44 @@ DECLARE @KillCount INT = 0;
 SELECT @KillCount = COUNT(*)
 FROM #SessionsToKill;
 
+-- برای دیباگ: نمایش تعداد جلساتی که باید kill شوند
+PRINT 'Sessions to kill: ' + CAST(@KillCount AS VARCHAR(10));
+
 WHILE @KillCount > 0 AND @MaxKillCount > 0
 BEGIN
     DECLARE @CurrentSessionID INT;
     DECLARE @CurrentActionLevel INT;
+    DECLARE @CurrentStatus NVARCHAR(30);
     DECLARE @KillCommand NVARCHAR(100);
     DECLARE @ErrorMessage NVARCHAR(MAX);
 
     -- اولویت‌بندی: ابتدا جلسات با ActionLevel بالا، سپس با BlockingScore بالا
     SELECT TOP 1
            @CurrentSessionID = BlockingSessionID,
-           @CurrentActionLevel = ActionLevel
+           @CurrentActionLevel = ActionLevel,
+           @CurrentStatus = SessionStatus
     FROM #SessionsToKill
     ORDER BY ActionLevel DESC,
              BlockingScore DESC;
 
+    -- برای دیباگ: نمایش جلسه‌ای که در حال kill شدن است
+    PRINT 'Attempting to kill session: ' + CAST(@CurrentSessionID AS VARCHAR(10)) + ' with ActionLevel: '
+          + CAST(@CurrentActionLevel AS VARCHAR(10)) + ' Status: ' + @CurrentStatus;
+
     IF @CurrentSessionID IS NOT NULL
     BEGIN
         BEGIN TRY
+            -- بررسی وجود جلسه بدون در نظر گرفتن وضعیت
             IF EXISTS
             (
                 SELECT 1
                 FROM sys.dm_exec_sessions
                 WHERE session_id = @CurrentSessionID
-                      AND status = 'running'
             )
             BEGIN
                 SET @KillCommand = N'KILL ' + CAST(@CurrentSessionID AS NVARCHAR(10));
 
-                -- به‌روزرسانی لاگ
+                -- به‌روزرسانی لاگ قبل از kill
                 UPDATE master.dbo.BlockingSessionsLog
                 SET KillReason = CASE @CurrentActionLevel
                                      WHEN 3 THEN
@@ -403,11 +450,21 @@ BEGIN
                 WHERE BlockingSessionID = @CurrentSessionID
                       AND Killed = 0;
 
+                -- برای دیباگ: نمایش دستور kill
+                PRINT 'Executing: ' + @KillCommand;
+
                 EXEC sp_executesql @KillCommand;
+
+                -- برای دیباگ: تأیید kill موفق
+                PRINT 'Session ' + CAST(@CurrentSessionID AS VARCHAR(10)) + ' killed successfully.';
+
                 SET @MaxKillCount = @MaxKillCount - 1;
             END;
             ELSE
             BEGIN
+                -- برای دیباگ: نمایش عدم وجود جلسه
+                PRINT 'Session ' + CAST(@CurrentSessionID AS VARCHAR(10)) + ' no longer exists.';
+
                 UPDATE master.dbo.BlockingSessionsLog
                 SET KillReason = N'Session no longer active'
                 WHERE BlockingSessionID = @CurrentSessionID
@@ -416,6 +473,9 @@ BEGIN
         END TRY
         BEGIN CATCH
             SET @ErrorMessage = ERROR_MESSAGE();
+
+            -- برای دیباگ: نمایش خطا
+            PRINT 'Error killing session ' + CAST(@CurrentSessionID AS VARCHAR(10)) + ': ' + @ErrorMessage;
 
             UPDATE master.dbo.BlockingSessionsLog
             SET KillReason = N'Error attempting to kill session',
@@ -431,6 +491,11 @@ BEGIN
     SELECT @KillCount = COUNT(*)
     FROM #SessionsToKill;
 END;
+
+-- برای دیباگ: نمایش تعداد جلسات باقی‌مانده
+PRINT 'Remaining sessions to kill: ' + CAST(@KillCount AS VARCHAR(10));
+
+-- پاک‌سازی جداول موقت
 DROP TABLE #SessionsToKill;
 DROP TABLE #NonCriticalSessions;
 DROP TABLE #BlockingSessions;
