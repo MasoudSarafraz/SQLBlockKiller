@@ -1,4 +1,3 @@
--- بهبود یافته برای SQL Server 2008 R2 با پشتیبانی از جلسات sleeping با تراکنش باز
 IF NOT EXISTS
 (
     SELECT 1
@@ -499,3 +498,4 @@ PRINT 'Remaining sessions to kill: ' + CAST(@KillCount AS VARCHAR(10));
 DROP TABLE #SessionsToKill;
 DROP TABLE #NonCriticalSessions;
 DROP TABLE #BlockingSessions;
+
